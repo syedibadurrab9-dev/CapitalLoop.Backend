@@ -1,235 +1,223 @@
 using Application.Common.Interfaces;
 using FluentValidation;
-using Infrastructure.Common.Interfaces;
-using Infrastructure.Data;
-using Infrastructure.Identity;
-using Infrastructure.SyncServices;
+using Infrastructure;
+using Infrastructure.Persistence;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
-using Microsoft.AspNetCore.OpenApi;
-using Microsoft.EntityFrameworkCore;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.IdentityModel.Tokens;
-using Microsoft.OpenApi;
 using Polly;
+using Scalar.AspNetCore;
+using System;
+using System.Collections.Generic;
 using System.Text;
+using System.Threading.Tasks;
 using WebApi.Hubs;
 using WebApi.Middleware;
 
 var builder = WebApplication.CreateBuilder(args);
+// 1. SERVICES REGISTRATION
 
-#region CONTROLLERS + SIGNALR
-builder.Services.AddControllers();
-builder.Services.AddSignalR();
-#endregion
-
-#region OPENAPI
-builder.Services.AddOpenApi(options =>
+bool isEfTooling = args.Any(a => a.Contains("ef") || a.Contains("migrations"));
+if (isEfTooling)
 {
-    options.AddDocumentTransformer((document, context, cancellationToken) =>
+    // Register the bare minimum needed for EF Core to reflect on the DbContext
+    builder.Services.AddInfrastructureServices(builder.Configuration);
+}
+else
+{
+    builder.Services.AddInfrastructureServices(builder.Configuration);
+    builder.Services.AddHttpContextAccessor();
+    builder.Services.AddScoped<ApplicationDbContextInitializer>();
+    builder.Services.AddControllers()
+        .AddApplicationPart(typeof(WebApi.Controllers.AiAdvisor.AdvisorController).Assembly);
+
+    builder.Services.AddSignalR(options =>
     {
-        document.Components ??= new OpenApiComponents();
+        options.EnableDetailedErrors = true;
+        options.HandshakeTimeout = TimeSpan.FromSeconds(15);
+    });
 
-        var scheme = new OpenApiSecurityScheme
+    // 2. OPENAPI
+    builder.Services.AddEndpointsApiExplorer();
+    builder.Services.AddOpenApi();
+
+    // 3. POLLY RESILIENCE
+    var retryPipeline = new ResiliencePipelineBuilder()
+        .AddRetry(new Polly.Retry.RetryStrategyOptions
         {
-            Type = SecuritySchemeType.Http,
-            Scheme = "bearer",
-            BearerFormat = "JWT",
-            In = ParameterLocation.Header,
-            Name = "Authorization",
-            Description = "Paste JWT token here"
-        };
+            ShouldHandle = new PredicateBuilder().Handle<HttpRequestException>(),
+            MaxRetryAttempts = 3,
+            Delay = TimeSpan.FromSeconds(2),
+            BackoffType = DelayBackoffType.Exponential
+        })
+        .Build();
+    builder.Services.AddSingleton<ResiliencePipeline>(retryPipeline);
 
-        document.Components.SecuritySchemes ??=
-            new Dictionary<string, IOpenApiSecurityScheme>();
+    #region MEDIATR & CQRS VALIDATE INTERCEPTORS
+    // Explicitly scope the runtime metadata footprints of both the Core Interface and Feature slices
+    var abstractionAssembly = typeof(IApplicationDbContext).Assembly;
+    var featureSlicesAssembly = typeof(Application.Portfolios.Commands.AuthenticateGoogleUserCommand).Assembly;
 
-        document.Components.SecuritySchemes["Bearer"] = scheme;
+    builder.Services.AddMediatR(cfg =>
+    {
+        cfg.RegisterServicesFromAssembly(abstractionAssembly);
+        cfg.RegisterServicesFromAssembly(featureSlicesAssembly);
+    });
 
-        var schemeReference = new OpenApiSecuritySchemeReference("Bearer", document);
+    // Wire up FluentValidation across both compiled domains
+    builder.Services.AddValidatorsFromAssembly(abstractionAssembly);
+    builder.Services.AddValidatorsFromAssembly(featureSlicesAssembly);
+    #endregion
 
-        document.Security ??= new List<OpenApiSecurityRequirement>();
-        document.Security.Add(new OpenApiSecurityRequirement
+    // =============================================================================
+    // 5. SECURITY MATRIX VALIDATION GATES (MULTI-AUTHORITY AUTH ENGINE) [CL-101]
+    // =============================================================================
+    var jwtSecret = builder.Configuration["Jwt:Secret"] ?? "SuperSecretLongBaseSecureKey6366F1!CapitalLoopMasterTokenValidationKey2026";
+    var jwtIssuer = builder.Configuration["Jwt:Issuer"] ?? "CapitalLoopAuthAuthority";
+    var jwtAudience = builder.Configuration["Jwt:Audience"] ?? "CapitalLoopMobileAppClients";
+
+    var googleClientIds = builder.Configuration.GetSection("Authentication:Google:ValidClientIds").Get<string[]?>()
+                          ?? Array.Empty<string>();
+
+    var paddedSecret = jwtSecret.Length >= 32 ? jwtSecret : jwtSecret.PadRight(32, '0');
+    var signingKeyBytes = Encoding.UTF8.GetBytes(paddedSecret);
+
+    builder.Services
+        .AddAuthentication(options =>
         {
-            { schemeReference, new List<string>() }
+            options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+            options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+        })
+        // 🔒 PIPELINE A: Handles internal re-signed symmetric tokens (Upgrades)
+        .AddJwtBearer(JwtBearerDefaults.AuthenticationScheme, options =>
+        {
+            options.TokenValidationParameters = new TokenValidationParameters
+            {
+                ValidateIssuer = true,
+                ValidateAudience = true,
+                ValidateLifetime = true,
+                ValidateIssuerSigningKey = true,
+                ValidIssuer = jwtIssuer,
+                ValidAudience = jwtAudience,
+                IssuerSigningKey = new SymmetricSecurityKey(signingKeyBytes),
+                ClockSkew = TimeSpan.FromMinutes(2),
+                NameClaimType = "name",
+                RoleClaimType = "role"
+            };
+
+            options.Events = new JwtBearerEvents
+            {
+                OnMessageReceived = context =>
+                {
+                    string? authorizationHeader = context.Request.Headers["Authorization"];
+
+                    if (!string.IsNullOrEmpty(authorizationHeader) && authorizationHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var inboundTokenRawString = authorizationHeader.Substring(7).Trim();
+
+                        Console.WriteLine("\n=============================================================================");
+                        Console.WriteLine($"🔍 [DIAGNOSTIC]: Token String Length: {inboundTokenRawString.Length}");
+                        Console.WriteLine($"🔍 [DIAGNOSTIC]: Contains Dots (Is JWT Layout?): {inboundTokenRawString.Contains(".")}");
+                        Console.WriteLine($"🔍 [DIAGNOSTIC]: Token Snapshot: {(inboundTokenRawString.Length > 20 ? inboundTokenRawString.Substring(0, 20) : inboundTokenRawString)}...");
+                        Console.WriteLine("=============================================================================\n");
+                    }
+
+                    var webSocketToken = context.Request.Query["access_token"];
+                    var requestPath = context.HttpContext.Request.Path;
+
+                    if (!string.IsNullOrEmpty(webSocketToken) && requestPath.StartsWithSegments("/hubs/support"))
+                    {
+                        context.Token = webSocketToken;
+                    }
+
+                    return Task.CompletedTask;
+                }
+            };
+        })
+        // 🌐 PIPELINE B: Handles federated Google ID Tokens automatically via Google's discovery endpoints
+        .AddJwtBearer("GoogleAuthScheme", options =>
+        {
+            options.Authority = "https://accounts.google.com";
+            options.TokenValidationParameters = new TokenValidationParameters
+            {
+                ValidateIssuer = true,
+                ValidIssuers = new[] { "https://accounts.google.com", "accounts.google.com" },
+                ValidateAudience = true,
+                ValidAudiences = googleClientIds,
+                ValidateLifetime = true,
+                ClockSkew = TimeSpan.FromMinutes(2),
+                NameClaimType = "name",
+                RoleClaimType = "role"
+            };
         });
 
-        document.SetReferenceHostDocument();
-
-        return Task.CompletedTask;
+    // 🛡️ RE-ALIGNED POLICY MANAGER: Standardized across both authentication pipelines
+    builder.Services.AddAuthorization(options =>
+    {
+        options.DefaultPolicy = new Microsoft.AspNetCore.Authorization.AuthorizationPolicyBuilder()
+            .RequireAuthenticatedUser()
+            .AddAuthenticationSchemes(JwtBearerDefaults.AuthenticationScheme, "GoogleAuthScheme")
+            .Build();
     });
-});
-#endregion
 
-#region DB CONTEXT
-builder.Services.AddDbContext<ApplicationDbContext>(options =>
-    options.UseSqlServer(
-        builder.Configuration.GetConnectionString("DefaultConnection")));
-
-builder.Services.AddScoped<IApplicationDbContext>(
-    p => p.GetRequiredService<ApplicationDbContext>());
-#endregion
-
-#region POLLY RESILIENCE FRAMEWORK
-var retryPipeline = new ResiliencePipelineBuilder()
-    .AddRetry(new Polly.Retry.RetryStrategyOptions
+    // =============================================================================
+    // 6. CROSS-ORIGIN RESOURCE SHARING FOOTPRINTS (CORS)
+    // =============================================================================
+    builder.Services.AddCors(options =>
     {
-        ShouldHandle = new PredicateBuilder().Handle<HttpRequestException>(),
-        MaxRetryAttempts = 3,
-        Delay = TimeSpan.FromSeconds(2),
-        BackoffType = DelayBackoffType.Exponential
-    })
-    .Build();
-
-builder.Services.AddSingleton(retryPipeline);
-#endregion
-
-#region HTTP CLIENTFACTORY REGISTRATIONS
-builder.Services.AddHttpClient();
-
-builder.Services.AddHttpClient("GoogleOAuth", client =>
-{
-    client.BaseAddress = new Uri("https://oauth2.googleapis.com");
-});
-
-// ✅ OPTIMIZED: Using named HttpClients with dedicated proxy lifecycle handling 
-// to prevent typed resolution conflicts with our Singleton Polly pipelines
-builder.Services.AddHttpClient<ICryptoSyncService, BinanceApiClient>(client =>
-{
-    // Sets up standard base paths safely for our low-level API handshake vectors
-    client.Timeout = TimeSpan.FromSeconds(15);
-});
-#endregion
-
-#region CORE APPLICATION SERVICES MANAGEMENT (DI)
-builder.Services.AddScoped<IIdentityService, GoogleSsoService>();
-builder.Services.AddScoped<IPreciousMetalSyncService, PreciousMetalsClient>();
-builder.Services.AddScoped<IPsxScraperService, PsxScraperService>();
-builder.Services.AddScoped<IAkdBrokerageSyncService, AkdBrokerageSyncService>();
-
-// ✅ FIXED: Registered the core data concrete worker to resolve the multi-asset translation dependencies
-builder.Services.AddScoped<IMarketDataService, MarketDataService>();
-#endregion
-
-#region MEDIATR & CQRS VALIDATE INTERCEPTORS
-var applicationAssembly = AppDomain.CurrentDomain.Load("Application");
-builder.Services.AddMediatR(cfg =>
-    cfg.RegisterServicesFromAssembly(applicationAssembly));
-builder.Services.AddValidatorsFromAssembly(applicationAssembly);
-#endregion
-
-#region AUTHENTICATION & SECURITY VALUATION FOR SECURE WEBSOCKETS
-var jwtSecret = builder.Configuration["Jwt:Secret"] ?? throw new InvalidOperationException("JWT Secret missing");
-var jwtIssuer = builder.Configuration["Jwt:Issuer"] ?? throw new InvalidOperationException("JWT Issuer missing");
-var jwtAudience = builder.Configuration["Jwt:Audience"] ?? throw new InvalidOperationException("JWT Audience missing");
-
-var googleClientIds = new List<string>();
-var audienceSection = builder.Configuration.GetSection("Authentication:Google:ValidClientIds");
-foreach (var child in audienceSection.GetChildren())
-{
-    if (!string.IsNullOrEmpty(child.Value))
-    {
-        googleClientIds.Add(child.Value);
-    }
+        options.AddPolicy("DevCors", policy =>
+        {
+            policy.WithOrigins(
+                    "http://localhost:4200",
+                    "http://localhost:8081",
+                    "http://10.20.0.81:8081",
+                    "http://10.20.0.97:8081",  // Office API Node
+                    "http://10.20.0.97:4200",  // Office Frontend Node
+                    "http://192.168.0.104:8081",
+                    "http://192.168.0.104:4200", // Home Frontend Node
+                    "https://capitalloop.com"
+                  )
+                  .AllowAnyHeader()
+                  .AllowAnyMethod()
+                  .AllowCredentials();
+        });
+    });
 }
 
-if (googleClientIds.Count == 0)
+// =============================================================================
+// 🚨 FORCE CONTAINER VALIDATION ON BUILD (SMASH SILENT INJECTOR DEADLOCKS)
+// =============================================================================
+builder.Host.UseDefaultServiceProvider((context, options) =>
 {
-    throw new InvalidOperationException("Google ValidClientIds configuration is missing from appsettings.");
-}
-
-builder.Services
-    .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
-    .AddJwtBearer(options =>
-    {
-        options.TokenValidationParameters = new TokenValidationParameters
-        {
-            ValidateIssuer = true,
-            ValidateAudience = true,
-            ValidateLifetime = true,
-            ValidateIssuerSigningKey = true,
-            ValidIssuer = jwtIssuer,
-            ValidAudience = jwtAudience,
-            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret))
-        };
-
-        options.Events = new JwtBearerEvents
-        {
-            OnMessageReceived = context =>
-            {
-                var token = context.Request.Query["access_token"];
-                var path = context.HttpContext.Request.Path;
-
-                // Captures state signatures explicitly when handshaking from Angular or React Native over raw websockets
-                if (!string.IsNullOrEmpty(token) && path.StartsWithSegments("/support-hub"))
-                {
-                    context.Token = token;
-                }
-
-                return Task.CompletedTask;
-            }
-        };
-    });
-
-builder.Services.AddAuthorization();
-#endregion
-
-#region CORS PIPELINES
-builder.Services.AddCors(options =>
-{
-    options.AddPolicy("DevCors", policy =>
-    {
-        policy.WithOrigins(
-                "http://localhost:4200",      // Angular Admin Desktop Web
-                "http://localhost:8081",      // React Native Local Simulation
-                "http://10.20.0.81:8081",     // Local Network Test Bridge
-                "http://192.168.0.100:8081"
-              )
-              .AllowAnyHeader()
-              .AllowAnyMethod()
-              .AllowCredentials(); // Mandated to sustain active real-time SignalR handshakes
-    });
+    options.ValidateScopes = true;    // Prevents captive dependency tracking bugs
+    options.ValidateOnBuild = true;   // 💥 Forces .NET to resolve all constructor trees instantly at boot up!
 });
-#endregion
 
 var app = builder.Build();
 
-#region MIDDLEWARE PIPELINE EXECUTIONS
-app.UseMiddleware<GlobalExceptionMiddleware>();
-#endregion
-
-#region DEV SWAGGER TOOLS
-if (app.Environment.IsDevelopment())
+if (!isEfTooling)
 {
-    app.MapOpenApi();
-    app.UseSwaggerUI(options =>
+    app.UseMiddleware<ExceptionHandlingMiddleware>();
+
+    if (app.Environment.IsDevelopment())
     {
-        options.SwaggerEndpoint("/openapi/v1.json", "CapitalLoop API v1");
-        options.RoutePrefix = "swagger";
-    });
-}
-#endregion
-
-app.UseRouting();
-app.UseCors("DevCors");
-
-app.UseAuthentication();
-app.UseAuthorization();
-
-app.MapControllers();
-app.MapHub<SupportHub>("/support-hub");
-
-#region DATABASE DATA SEED WORKER
-using (var scope = app.Services.CreateScope())
-{
-    try
-    {
-        var context = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
-        await ApplicationDbContext.SeedDataAsync(context);
+        app.MapOpenApi();
+        app.MapScalarApiReference();
     }
-    catch (Exception ex)
-    {
-        var logger = scope.ServiceProvider.GetRequiredService<ILogger<Program>>();
-        logger.LogError(ex, "Startup database seed instantiation failed.");
-    }
+
+    app.UseRouting();
+    app.UseCors("DevCors");
+    app.UseAuthentication();
+    app.UseAuthorization();
+    app.UseMiddleware<SubscriptionGateMiddleware>();
+
+    app.MapControllers();
+    app.MapHub<SupportHub>("/hubs/support");
 }
-#endregion
 
 app.Run();
