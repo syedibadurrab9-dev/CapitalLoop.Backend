@@ -1,69 +1,75 @@
-﻿using Application.Common.Interfaces; // Assuming IApplicationDbContext lives here
+using Application.Common.Interfaces;
+using Application.Portfolios.Commands.EvaluateSuitability;
 using Application.Portfolios.Queries.GetRiskAuditSummary;
-using Infrastructure.Common.Interfaces;
+using Application.Portfolios.Queries.GetSuitabilityProfile;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
-using System.Security.Claims;
 
-namespace WebApi.Controllers
+namespace WebApi.Controllers;
+
+[Authorize] // Protect auditing matrices via secure JWT verification filters
+public class AiAdvisorController : BaseApiController
 {
-    [Authorize] // Protect auditing matrices via secure JWT verification filters
-    [ApiController]
-    [Route("api/[controller]")]
-    public class AiAdvisorController : BaseApiController
+    private readonly IQueryHandler<GetRiskAuditSummaryQuery, RiskAuditDto> _riskAuditHandler;
+    private readonly ICommandHandler<EvaluateSuitabilityCommand, SuitabilityProfileResultDto> _suitabilityHandler;
+    private readonly IQueryHandler<GetSuitabilityProfileQuery, SuitabilityProfileResultDto> _profileQueryHandler;
+
+    public AiAdvisorController(
+        IQueryHandler<GetRiskAuditSummaryQuery, RiskAuditDto> riskAuditHandler,
+        ICommandHandler<EvaluateSuitabilityCommand, SuitabilityProfileResultDto> suitabilityHandler,
+        IQueryHandler<GetSuitabilityProfileQuery, SuitabilityProfileResultDto> profileQueryHandler)
     {
-        // Note: You can keep _context here if this controller needs to evaluate 
-        // secondary profile states, otherwise MediatR isolates all DB data logic.
-        private readonly IApplicationDbContext _context;
+        _riskAuditHandler = riskAuditHandler;
+        _suitabilityHandler = suitabilityHandler;
+        _profileQueryHandler = profileQueryHandler;
+    }
 
-        public AiAdvisorController(IApplicationDbContext context)
+    /// <summary>
+    /// Evaluates active portfolio nodes to flag over-concentration risk against sector ceilings.
+    /// GET: api/AiAdvisor/audit-exposure?maxSectorCapPercentage=35.0
+    /// </summary>
+    [HttpGet("audit-exposure")]
+    public async Task<IActionResult> AuditExposure([FromQuery] decimal? maxSectorCapPercentage, CancellationToken cancellationToken)
+    {
+        var userEmail = GetUserEmailFromClaims();
+        decimal targetCapCeiling = maxSectorCapPercentage ?? 30.0m;
+
+        if (targetCapCeiling <= 0 || targetCapCeiling > 100)
         {
-            _context = context;
+            return BadRequest(new { Message = "The sector distribution constraint ceiling parameter must sit between 0 and 100 percent." });
         }
 
-        /// <summary>
-        /// Evaluates active portfolio nodes to flag over-concentration risk against sector ceilings.
-        /// GET: api/AiAdvisor/audit-exposure?maxSectorCapPercentage=35.0
-        /// </summary>
-        [HttpGet("audit-exposure")]
-        public async Task<IActionResult> AuditExposure([FromQuery] decimal? maxSectorCapPercentage, CancellationToken cancellationToken)
-        {
-            // 1. Extract the secure, validated email string directly from the JWT claims token payload
-            var userEmail = GetUserEmailFromClaims();
+        var validationAudit = await _riskAuditHandler.HandleAsync(
+            new GetRiskAuditSummaryQuery(userEmail, targetCapCeiling),
+            cancellationToken);
 
-            // 2. Define a resilient threshold barrier fallback if the client leaves parameters unassigned
-            decimal targetCapCeiling = maxSectorCapPercentage ?? 30.0m;
+        return Ok(validationAudit);
+    }
 
-            if (targetCapCeiling <= 0 || targetCapCeiling > 100)
-            {
-                return BadRequest(new { Message = "The sector distribution constraint ceiling parameter must sit between 0 and 100 percent." });
-            }
+    /// <summary>
+    /// Evaluates user's SECP suitability questionnaire answers, maps to risk profile, and enforces hard allocation caps.
+    /// POST: api/AiAdvisor/suitability/evaluate
+    /// </summary>
+    [HttpPost("suitability/evaluate")]
+    public async Task<IActionResult> EvaluateSuitability([FromBody] EvaluateSuitabilityRequest request, CancellationToken cancellationToken)
+    {
+        var userEmail = GetUserEmailFromClaims();
+        var command = new EvaluateSuitabilityCommand(userEmail, request.Answers);
+        var result = await _suitabilityHandler.HandleAsync(command, cancellationToken);
+        return Ok(result);
+    }
 
-            // 3. Construct and dispatch the updated structural MediatR request pipeline contract
-            var query = new GetRiskAuditSummaryQuery(userEmail, targetCapCeiling);
-
-            var validationAudit = await Mediator.Send(query, cancellationToken);
-            return Ok(validationAudit);
-        }
-
-        #region PRIVATE UTILITY METHODS
-
-        /// <summary>
-        /// Safely extracts the user's validated identity email context from incoming JWT authentication claims.
-        /// </summary>
-        private string GetUserEmailFromClaims()
-        {
-            var emailClaim = User.FindFirstValue(ClaimTypes.Email)
-                             ?? User.Identity?.Name;
-
-            if (string.IsNullOrEmpty(emailClaim))
-            {
-                throw new UnauthorizedAccessException("The authenticated context contains an invalid or empty identity signature record.");
-            }
-
-            return emailClaim.ToLowerInvariant();
-        }
-
-        #endregion
+    /// <summary>
+    /// Retrieves user's registered SECP suitability profile, regulatory hard caps, and compliance state.
+    /// GET: api/AiAdvisor/suitability/profile
+    /// </summary>
+    [HttpGet("suitability/profile")]
+    public async Task<IActionResult> GetSuitabilityProfile(CancellationToken cancellationToken)
+    {
+        var userEmail = GetUserEmailFromClaims();
+        var result = await _profileQueryHandler.HandleAsync(new GetSuitabilityProfileQuery(userEmail), cancellationToken);
+        return Ok(result);
     }
 }
+
+public record EvaluateSuitabilityRequest(List<int> Answers);

@@ -1,32 +1,42 @@
-﻿using Application.Common.DTOs;
+using Application.Common.DTOs;
 using Application.Common.Interfaces;
 using Domain.Entities;
 using Domain.Enums;
+using FluentValidation;
 using Infrastructure.Common.Interfaces;
-using MediatR;
 using Microsoft.EntityFrameworkCore;
 
 namespace Application.Portfolios.Commands.LinkBinanceWallet;
 
-public class LinkBinanceWalletCommandHandler : IRequestHandler<LinkBinanceWalletCommand, BinanceSyncResult>
+public class LinkBinanceWalletCommandHandler : ICommandHandler<LinkBinanceWalletCommand, BinanceSyncResult>
 {
     private readonly IApplicationDbContext _context;
     private readonly ICryptoSyncService _cryptoSyncService;
+    private readonly IValidator<LinkBinanceWalletCommand>? _validator;
 
-    public LinkBinanceWalletCommandHandler(IApplicationDbContext context, ICryptoSyncService cryptoSyncService)
+    public LinkBinanceWalletCommandHandler(
+        IApplicationDbContext context,
+        ICryptoSyncService cryptoSyncService,
+        IValidator<LinkBinanceWalletCommand>? validator = null)
     {
         _context = context;
         _cryptoSyncService = cryptoSyncService;
+        _validator = validator;
     }
 
-    public async Task<BinanceSyncResult> Handle(LinkBinanceWalletCommand request, CancellationToken cancellationToken)
+    public async Task<BinanceSyncResult> HandleAsync(LinkBinanceWalletCommand command, CancellationToken cancellationToken)
     {
+        if (_validator != null)
+        {
+            await _validator.ValidateAndThrowAsync(command, cancellationToken);
+        }
+
         // 1. Handshake with the infrastructure-level integration service to query Binance endpoints securely
-        var syncResult = await _cryptoSyncService.FetchExtendedPortfolioBalancesAsync(request.ApiKey, request.SecretKey);
+        var syncResult = await _cryptoSyncService.FetchExtendedPortfolioBalancesAsync(command.ApiKey, command.SecretKey);
 
         // 2. Query the DB context to look for an existing auto-synced Crypto node for this user profile
         var existingCryptoNode = await _context.Assets
-            .FirstOrDefaultAsync(n => n.UserEmail == request.UserEmail.ToLowerInvariant()
+            .FirstOrDefaultAsync(n => n.UserEmail == command.UserEmail.ToLowerInvariant()
                                  && n.Category == AssetCategory.Crypto
                                  && n.IsAutoSynced, cancellationToken);
 
@@ -39,7 +49,7 @@ public class LinkBinanceWalletCommandHandler : IRequestHandler<LinkBinanceWallet
         {
             // Construct a pristine, tracking-ready asset tree node for new integrations
             var binanceNode = AssetNode.CreateManual(
-                email: request.UserEmail,
+                email: command.UserEmail,
                 name: "Binance Integrated Wallet",
                 category: AssetCategory.Crypto,
                 value: syncResult.TotalValuePkr

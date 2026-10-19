@@ -1,6 +1,6 @@
-﻿namespace Domain.Exceptions;
+namespace Domain.Exceptions;
 
-public class InvalidInstallmentSchemaException : Exception
+public class InvalidInstallmentSchemaException : DomainException
 {
     public InvalidInstallmentSchemaException(string message) : base(message) { }
 }

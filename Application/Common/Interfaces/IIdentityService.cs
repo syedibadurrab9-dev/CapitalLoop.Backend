@@ -1,4 +1,4 @@
-﻿using Application.Common.DTOs;
+using Application.Common.DTOs;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -17,5 +17,6 @@ public interface IIdentityService
     Task<AuthResultDto> ValidateGoogleTokenAndGenerateJwtAsync(
         string incomingPayload,
         string? codeVerifier,
+        string? redirectUri,
         CancellationToken cancellationToken);
 }

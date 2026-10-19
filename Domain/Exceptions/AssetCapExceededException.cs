@@ -1,6 +1,6 @@
-﻿namespace Domain.Exceptions;
+namespace Domain.Exceptions;
 
-public class AssetCapExceededException : Exception
+public class AssetCapExceededException : DomainException
 {
     public AssetCapExceededException(string message) : base(message) { }
 }

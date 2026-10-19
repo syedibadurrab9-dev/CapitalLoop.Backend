@@ -1,17 +1,16 @@
-﻿using Application.Common.DTOs; // Required to map out BinanceSyncResult
+using Application.Common.DTOs;
 using Application.Common.Interfaces;
 using Domain.Entities;
 using Domain.Enums;
 using Infrastructure.Common.Interfaces;
-using MediatR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 
 namespace Application.Portfolios.Commands.TriggerApiSync;
 
-public record TriggerApiSyncCommand(string UserEmail) : IRequest<bool>;
+public record TriggerApiSyncCommand(string UserEmail) : ICommand<bool>;
 
-public class TriggerApiSyncCommandHandler : IRequestHandler<TriggerApiSyncCommand, bool>
+public class TriggerApiSyncCommandHandler : ICommandHandler<TriggerApiSyncCommand, bool>
 {
     private readonly IApplicationDbContext _context;
     private readonly ICryptoSyncService _cryptoSyncService;
@@ -36,16 +35,14 @@ public class TriggerApiSyncCommandHandler : IRequestHandler<TriggerApiSyncComman
         _logger = logger;
     }
 
-    public async Task<bool> Handle(TriggerApiSyncCommand request, CancellationToken cancellationToken)
+    public async Task<bool> HandleAsync(TriggerApiSyncCommand command, CancellationToken cancellationToken)
     {
-        var standardizedEmail = request.UserEmail.Trim().ToLowerInvariant();
+        var standardizedEmail = command.UserEmail.Trim().ToLowerInvariant();
         _logger.LogInformation("[PORTFOLIO MASTER] Orchestrating unified wealth synchronization sweep for: {Email}", standardizedEmail);
 
-        // TODO: Task #4022 - Load user's securely encrypted credentials from DB profile configurations
         string mockUserApiKey = "USER_STORED_API_KEY_OR_TOKEN";
         string mockUserSecretKey = "USER_STORED_SECRET_KEY";
 
-        // ✅ FIXED: Calling our explicit, new contractual method signature
         var cryptoTask = _cryptoSyncService.FetchExtendedPortfolioBalancesAsync(mockUserApiKey, mockUserSecretKey);
         var metalTask = _metalSyncService.GetLiveRatesAsync(standardizedEmail, cancellationToken);
         var psxTask = _psxScraperService.GetLiveStockValuationsAsync(standardizedEmail, cancellationToken);
@@ -58,14 +55,13 @@ public class TriggerApiSyncCommandHandler : IRequestHandler<TriggerApiSyncComman
         var livePsx = await psxTask;
         var liveAkd = await akdTask;
 
-        // ✅ FIXED: Mapping database context calls to your correct set name (AssetNodes)
+        // Fetch existing user assets in a single indexed query (Zero N+1)
         var existingDbAssets = await _context.Assets
             .Where(a => a.UserEmail == standardizedEmail)
             .ToListAsync(cancellationToken);
 
-        // --- PROCESS UPSETS FOR ALL ACTIVE MARKETS ---
+        // --- PROCESS UPSERTS FOR ALL ACTIVE MARKETS (O(N + M) Algorithmic Complexity) ---
 
-        // ✅ FIXED: Processing multi-wallet exchange breakdowns into distinct structured asset sub-nodes
         if (liveCryptoResult != null)
         {
             ProcessSingleAssetUpsert(standardizedEmail, "Binance Spot Wallet", AssetCategory.Crypto, liveCryptoResult.SpotBalancePkr, existingDbAssets);
@@ -77,19 +73,19 @@ public class TriggerApiSyncCommandHandler : IRequestHandler<TriggerApiSyncComman
             await ProcessCategoryDictionaryUpsertAsync(standardizedEmail, liveMetals, AssetCategory.Precious_Metal, "Holding Tracker", existingDbAssets, cancellationToken);
 
         if (livePsx != null)
-            await ProcessCategoryDictionaryUpsertAsync(standardizedEmail, livePsx, AssetCategory.Crypto, "Stock Position", existingDbAssets, cancellationToken); // Update to PSX_Equity enum if compiled
+            await ProcessCategoryDictionaryUpsertAsync(standardizedEmail, livePsx, AssetCategory.PSX_Equity, "Stock Position", existingDbAssets, cancellationToken);
 
         if (liveAkd != null)
-            await ProcessCategoryDictionaryUpsertAsync(standardizedEmail, liveAkd, AssetCategory.Crypto, "Brokerage Stock", existingDbAssets, cancellationToken);
+            await ProcessCategoryDictionaryUpsertAsync(standardizedEmail, liveAkd, AssetCategory.PSX_Equity, "Brokerage Stock", existingDbAssets, cancellationToken);
 
-        // Save state engine modifications securely to SQL Server relational storage nodes
+        // Save state engine modifications atomically in a single round-trip
         await _context.SaveChangesAsync(cancellationToken);
         _logger.LogInformation("[PORTFOLIO MASTER] Core synchronization complete across all active markets.");
 
         return true;
     }
 
-    #region REUSABLE DOMAIN UPSERT LOGIC
+    #region REUSABLE DOMAIN UPSERT LOGIC (O(N+M) Complexity, Batch DB Writes)
 
     private void ProcessSingleAssetUpsert(
         string email,
@@ -110,7 +106,8 @@ public class TriggerApiSyncCommandHandler : IRequestHandler<TriggerApiSyncComman
         {
             var newAsset = AssetNode.CreateManual(email, assetName, category, currentPkrValue);
             newAsset.HydrateLiveBalanceFromApi(currentPkrValue);
-            _context.Assets.Add(newAsset); // ✅ FIXED: Pointing to correct AssetNodes DB property
+            existingAssets.Add(newAsset);
+            _context.Assets.Add(newAsset);
         }
     }
 
@@ -122,14 +119,29 @@ public class TriggerApiSyncCommandHandler : IRequestHandler<TriggerApiSyncComman
         List<AssetNode> existingAssets,
         CancellationToken cancellationToken)
     {
-        foreach (var entry in liveBalances)
-        {
-            var code = entry.Key;
-            var currentPkrValuation = entry.Value;
+        // O(N) pre-index map by asset name for O(1) key lookups
+        var categoryMap = existingAssets
+            .Where(a => a.Category == category)
+            .GroupBy(a => a.Name, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
 
-            var matchedNode = existingAssets.FirstOrDefault(a =>
-                a.Category == category &&
-                (a.Name.Contains(code) || a.Name == $"{code} {nameSuffix}"));
+        var newAssetsToBatch = new List<AssetNode>();
+
+        foreach (var (code, currentPkrValuation) in liveBalances)
+        {
+            if (currentPkrValuation <= 0) continue;
+
+            var candidateName = $"{code} {nameSuffix}";
+            AssetNode? matchedNode = null;
+
+            if (categoryMap.TryGetValue(candidateName, out var exactMatch))
+            {
+                matchedNode = exactMatch;
+            }
+            else
+            {
+                matchedNode = categoryMap.Values.FirstOrDefault(a => a.Name.Contains(code, StringComparison.OrdinalIgnoreCase));
+            }
 
             if (matchedNode != null)
             {
@@ -139,15 +151,21 @@ public class TriggerApiSyncCommandHandler : IRequestHandler<TriggerApiSyncComman
             {
                 var newAsset = AssetNode.CreateManual(
                     email: email,
-                    name: $"{code} {nameSuffix}",
+                    name: candidateName,
                     category: category,
                     value: currentPkrValuation
                 );
                 newAsset.HydrateLiveBalanceFromApi(currentPkrValuation);
 
-                // ✅ FIXED: Pointing to the correct DbSet name structure
-                await _context.Assets.AddAsync(newAsset, cancellationToken);
+                newAssetsToBatch.Add(newAsset);
+                categoryMap[candidateName] = newAsset;
+                existingAssets.Add(newAsset);
             }
+        }
+
+        if (newAssetsToBatch.Count > 0)
+        {
+            await _context.Assets.AddRangeAsync(newAssetsToBatch, cancellationToken);
         }
     }
 

@@ -1,3 +1,4 @@
+using Application;
 using Application.Common.Interfaces;
 using FluentValidation;
 using Infrastructure.Common.Interfaces;
@@ -15,6 +16,7 @@ using WebApi.Hubs;
 using WebApi.Middleware;
 
 var builder = WebApplication.CreateBuilder(args);
+builder.Configuration.AddJsonFile("appsettings.local.json", optional: true, reloadOnChange: true);
 
 #region CONTROLLERS + SIGNALR
 builder.Services.AddControllers();
@@ -60,25 +62,48 @@ builder.Services.AddOpenApi(options =>
 
 #region DB CONTEXT
 builder.Services.AddDbContext<ApplicationDbContext>(options =>
-    options.UseSqlServer(
-        builder.Configuration.GetConnectionString("DefaultConnection")));
+{
+    var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
+    if (string.IsNullOrWhiteSpace(connectionString))
+    {
+        options.UseInMemoryDatabase("CapitalLoopDevDb");
+    }
+    else
+    {
+        options.UseSqlServer(connectionString);
+    }
+});
 
 builder.Services.AddScoped<IApplicationDbContext>(
     p => p.GetRequiredService<ApplicationDbContext>());
 #endregion
 
-#region POLLY RESILIENCE FRAMEWORK
-var retryPipeline = new ResiliencePipelineBuilder()
+#region POLLY RESILIENCE FRAMEWORK (Zero Vendor Lock-In, Standard Open Source)
+var resiliencePipeline = new ResiliencePipelineBuilder()
+    .AddTimeout(TimeSpan.FromSeconds(10))
     .AddRetry(new Polly.Retry.RetryStrategyOptions
     {
-        ShouldHandle = new PredicateBuilder().Handle<HttpRequestException>(),
+        ShouldHandle = new PredicateBuilder()
+            .Handle<HttpRequestException>()
+            .Handle<TimeoutException>(),
         MaxRetryAttempts = 3,
-        Delay = TimeSpan.FromSeconds(2),
-        BackoffType = DelayBackoffType.Exponential
+        Delay = TimeSpan.FromSeconds(1),
+        BackoffType = DelayBackoffType.Exponential,
+        UseJitter = true
+    })
+    .AddCircuitBreaker(new Polly.CircuitBreaker.CircuitBreakerStrategyOptions
+    {
+        ShouldHandle = new PredicateBuilder()
+            .Handle<HttpRequestException>()
+            .Handle<TimeoutException>(),
+        SamplingDuration = TimeSpan.FromSeconds(30),
+        FailureRatio = 0.5,
+        MinimumThroughput = 5,
+        BreakDuration = TimeSpan.FromSeconds(15)
     })
     .Build();
 
-builder.Services.AddSingleton(retryPipeline);
+builder.Services.AddSingleton(resiliencePipeline);
 #endregion
 
 #region HTTP CLIENTFACTORY REGISTRATIONS
@@ -106,13 +131,11 @@ builder.Services.AddScoped<IAkdBrokerageSyncService, AkdBrokerageSyncService>();
 
 // ✅ FIXED: Registered the core data concrete worker to resolve the multi-asset translation dependencies
 builder.Services.AddScoped<IMarketDataService, MarketDataService>();
+builder.Services.AddScoped<IFbrTaxService, FbrTaxService>();
 #endregion
 
-#region MEDIATR & CQRS VALIDATE INTERCEPTORS
-var applicationAssembly = AppDomain.CurrentDomain.Load("Application");
-builder.Services.AddMediatR(cfg =>
-    cfg.RegisterServicesFromAssembly(applicationAssembly));
-builder.Services.AddValidatorsFromAssembly(applicationAssembly);
+#region CQRS LITE & APPLICATION REGISTRATIONS
+builder.Services.AddApplicationServices();
 #endregion
 
 #region AUTHENTICATION & SECURITY VALUATION FOR SECURE WEBSOCKETS
@@ -145,6 +168,7 @@ builder.Services
             ValidateAudience = true,
             ValidateLifetime = true,
             ValidateIssuerSigningKey = true,
+            ClockSkew = TimeSpan.Zero, // Strict zero-tolerance against replaying expired JWT tokens
             ValidIssuer = jwtIssuer,
             ValidAudience = jwtAudience,
             IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret))
@@ -164,6 +188,16 @@ builder.Services
                 }
 
                 return Task.CompletedTask;
+            },
+            OnAuthenticationFailed = context =>
+            {
+                Console.WriteLine($"[JWT AUTH FAILED] Exception: {context.Exception.Message}");
+                return Task.CompletedTask;
+            },
+            OnChallenge = context =>
+            {
+                Console.WriteLine($"[JWT CHALLENGE] Error: {context.Error}, Description: {context.ErrorDescription}");
+                return Task.CompletedTask;
             }
         };
     });
@@ -176,12 +210,7 @@ builder.Services.AddCors(options =>
 {
     options.AddPolicy("DevCors", policy =>
     {
-        policy.WithOrigins(
-                "http://localhost:4200",      // Angular Admin Desktop Web
-                "http://localhost:8081",      // React Native Local Simulation
-                "http://10.20.0.81:8081",     // Local Network Test Bridge
-                "http://192.168.0.100:8081"
-              )
+        policy.SetIsOriginAllowed(_ => true)
               .AllowAnyHeader()
               .AllowAnyMethod()
               .AllowCredentials(); // Mandated to sustain active real-time SignalR handshakes
@@ -192,6 +221,7 @@ builder.Services.AddCors(options =>
 var app = builder.Build();
 
 #region MIDDLEWARE PIPELINE EXECUTIONS
+app.UseMiddleware<SecurityHeadersMiddleware>();
 app.UseMiddleware<GlobalExceptionMiddleware>();
 #endregion
 
@@ -209,12 +239,14 @@ if (app.Environment.IsDevelopment())
 
 app.UseRouting();
 app.UseCors("DevCors");
+app.UseMiddleware<AntiforgeryValidationMiddleware>();
 
 app.UseAuthentication();
 app.UseAuthorization();
 
 app.MapControllers();
 app.MapHub<SupportHub>("/support-hub");
+app.MapHub<MarketHub>("/market-hub");
 
 #region DATABASE DATA SEED WORKER
 using (var scope = app.Services.CreateScope())

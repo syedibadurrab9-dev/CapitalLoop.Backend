@@ -1,13 +1,14 @@
-﻿using Infrastructure.Common.Interfaces;
-using MediatR;
+using Application.Common.Interfaces;
+using Infrastructure.Common.Interfaces;
 using Microsoft.EntityFrameworkCore;
+
 namespace Application.Portfolios.Queries.GetLiveChartsData;
 
-public record GetLiveChartsDataQuery(string UserEmail) : IRequest<List<ChartDataPointDto>>;
+public record GetLiveChartsDataQuery(string UserEmail) : IQuery<List<ChartDataPointDto>>;
 
 public record ChartDataPointDto(string AssetLabel, string CategoryType, decimal EvaluationValue, bool AutoSynced);
 
-public class GetLiveChartsDataQueryHandler : IRequestHandler<GetLiveChartsDataQuery, List<ChartDataPointDto>>
+public class GetLiveChartsDataQueryHandler : IQueryHandler<GetLiveChartsDataQuery, List<ChartDataPointDto>>
 {
     private readonly IApplicationDbContext _context;
 
@@ -16,10 +17,11 @@ public class GetLiveChartsDataQueryHandler : IRequestHandler<GetLiveChartsDataQu
         _context = context;
     }
 
-    public async Task<List<ChartDataPointDto>> Handle(GetLiveChartsDataQuery request, CancellationToken cancellationToken)
+    public async Task<List<ChartDataPointDto>> HandleAsync(GetLiveChartsDataQuery query, CancellationToken cancellationToken)
     {
         var activeAssets = await _context.Assets
-            .Where(a => a.UserEmail == request.UserEmail.ToLowerInvariant())
+            .AsNoTracking()
+            .Where(a => a.UserEmail == query.UserEmail.ToLowerInvariant())
             .OrderByDescending(a => a.HoldingValuePKR)
             .Select(a => new ChartDataPointDto(
                 a.Name,

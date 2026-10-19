@@ -1,4 +1,4 @@
-﻿using Domain.Entities;
+using Domain.Entities;
 using Domain.Enums; // Crucial for mapping your KycStatus enum targets
 using Infrastructure.Common.Interfaces;
 using Microsoft.EntityFrameworkCore;
@@ -12,6 +12,8 @@ public class ApplicationDbContext : DbContext, IApplicationDbContext
     public DbSet<UserProfile> UserProfiles => Set<UserProfile>();
     public DbSet<AssetNode> Assets => Set<AssetNode>();
     public DbSet<KycDocument> KycDocuments => Set<KycDocument>();
+    public DbSet<ComplianceAuditLog> ComplianceAuditLogs => Set<ComplianceAuditLog>();
+    public DbSet<AdminOperator> AdminOperators => Set<AdminOperator>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -27,7 +29,49 @@ public class ApplicationDbContext : DbContext, IApplicationDbContext
         // 1. Ensure the underlying database container exists
         await context.Database.EnsureCreatedAsync();
 
+        if (context.Database.IsRelational())
+        {
+            await context.Database.ExecuteSqlRawAsync(@"
+                IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'AdminOperators')
+                BEGIN
+                    CREATE TABLE AdminOperators (
+                        Id UNIQUEIDENTIFIER PRIMARY KEY,
+                        Name NVARCHAR(256) NOT NULL,
+                        Email NVARCHAR(256) NOT NULL,
+                        Role INT NOT NULL,
+                        LicenseNumber NVARCHAR(128) NULL,
+                        IsActive BIT NOT NULL,
+                        OnboardedUtc DATETIME2 NOT NULL,
+                        OnboardedBy NVARCHAR(256) NOT NULL
+                    );
+                END
+            ");
+        }
+
         const string targetUserEmail = "syedibad335@gmail.com";
+
+        // Seed initial Super Admin operator
+        if (!await context.AdminOperators.AnyAsync(o => o.Email == targetUserEmail))
+        {
+            var superAdmin = AdminOperator.Provision(
+                "Syed Ibad Ur Rab",
+                targetUserEmail,
+                AdminRole.SuperAdmin,
+                "SECP-ADV-8492",
+                "SYSTEM_GENESIS"
+            );
+            await context.AdminOperators.AddAsync(superAdmin);
+
+            var complianceLead = AdminOperator.Provision(
+                "Compliance Officer",
+                "compliance@capitalloop.com",
+                AdminRole.ComplianceOfficer,
+                "SECP-ADV-4821",
+                targetUserEmail
+            );
+            await context.AdminOperators.AddAsync(complianceLead);
+            await context.SaveChangesAsync();
+        }
 
         // 2. Step A: Seed User Profile using the Domain Factory 'Register' Method
         if (!await context.UserProfiles.AnyAsync(u => u.Email == targetUserEmail))

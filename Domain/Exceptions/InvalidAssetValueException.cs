@@ -1,6 +1,6 @@
-﻿namespace Domain.Exceptions;
+namespace Domain.Exceptions;
 
-public class InvalidAssetValueException : Exception
+public class InvalidAssetValueException : DomainException
 {
     public InvalidAssetValueException(string message) : base(message) { }
 }

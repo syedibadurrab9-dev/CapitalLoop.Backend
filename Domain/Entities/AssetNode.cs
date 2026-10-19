@@ -1,4 +1,4 @@
-﻿using Domain.Common;
+using Domain.Common;
 using Domain.Enums;
 using Domain.Exceptions;
 
@@ -45,6 +45,30 @@ public class AssetNode : Entity
     {
         HoldingValuePKR = synchedValue;
         IsAutoSynced = true;
+        LastUpdatedUtc = DateTime.UtcNow;
+    }
+
+    public void UpdateInstallments(int paid, int total, decimal? updatedValuation = null)
+    {
+        if (Category != AssetCategory.Real_Estate)
+            throw new InvalidOperationException("Installment telemetry updates apply exclusively to real estate asset nodes.");
+
+        if (paid < 0 || total <= 0)
+            throw new InvalidInstallmentSchemaException("Installment parameters must be positive integers.");
+
+        if (paid > total)
+            throw new InvalidInstallmentSchemaException("Completed payments cannot outpace your master real estate file framework.");
+
+        InstallmentsPaid = paid;
+        TotalInstallments = total;
+
+        if (updatedValuation.HasValue)
+        {
+            if (updatedValuation.Value <= 0)
+                throw new InvalidAssetValueException("Updated real estate valuation must be positive.");
+            HoldingValuePKR = updatedValuation.Value;
+        }
+
         LastUpdatedUtc = DateTime.UtcNow;
     }
 }

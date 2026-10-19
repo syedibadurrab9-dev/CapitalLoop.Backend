@@ -1,9 +1,8 @@
-﻿using Application.Portfolios.Commands.GoogleSso;
+using Application.Common.DTOs;
+using Application.Common.Interfaces;
+using Application.Portfolios.Commands.GoogleSso;
 using Microsoft.AspNetCore.Mvc;
-using System;
 using System.ComponentModel.DataAnnotations;
-using System.Threading;
-using System.Threading.Tasks;
 
 namespace WebApi.Controllers;
 
@@ -12,12 +11,18 @@ public class GoogleSsoRequest
     [Required]
     public string Token { get; set; } = string.Empty; // Holds either the Mobile idToken OR the Web raw Auth Code
 
-    public string? CodeVerifier { get; set; } // 🚀 Required for secure Angular Web applications using PKCE validation
+    public string? CodeVerifier { get; set; } // Required for secure Angular Web applications using PKCE validation
+    public string? RedirectUri { get; set; } // Optional redirect URI if exchanging auth code via PKCE
 }
 
 public class AuthController : BaseApiController
 {
-    // MediatR sender instance is automatically provided by inheriting from BaseApiController
+    private readonly ICommandHandler<GoogleSsoCommand, AuthResultDto> _googleSsoHandler;
+
+    public AuthController(ICommandHandler<GoogleSsoCommand, AuthResultDto> googleSsoHandler)
+    {
+        _googleSsoHandler = googleSsoHandler;
+    }
 
     [HttpPost("google-sso")]
     public async Task<IActionResult> GoogleSso([FromBody] GoogleSsoRequest request, CancellationToken cancellationToken)
@@ -30,8 +35,9 @@ public class AuthController : BaseApiController
 
         try
         {
-            // 🚀 FIXED: Now mapping both request parameters into the updated CQRS Command constructor
-            var result = await Mediator.Send(new GoogleSsoCommand(request.Token, request.CodeVerifier), cancellationToken);
+            var result = await _googleSsoHandler.HandleAsync(
+                new GoogleSsoCommand(request.Token, request.CodeVerifier, request.RedirectUri),
+                cancellationToken);
 
             // Returns a single unified response payload that satisfies both Redux (mobile) and local storage (web) hydrations
             return Ok(new
@@ -42,6 +48,9 @@ public class AuthController : BaseApiController
                 email = result.Email,
                 tier = result.Tier,
                 isPremium = result.IsPremium,
+                role = result.Role,
+                licenseNumber = result.LicenseNumber,
+                kycStatus = result.KycStatus,
                 success = result.Success
             });
         }
