@@ -193,6 +193,8 @@ public class GoogleSsoService : IIdentityService
             ? redirectUri.Trim()
             : "http://localhost:4200/login";
 
+        _logger.LogInformation("🔄 Exchanging token with Google OAuth API. redirect_uri: {RedirectUri}", finalRedirectUri);
+
         var requestParameters = new Dictionary<string, string>
         {
             { "grant_type", "authorization_code" },

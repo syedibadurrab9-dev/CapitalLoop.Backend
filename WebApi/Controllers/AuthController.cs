@@ -35,8 +35,18 @@ public class AuthController : BaseApiController
 
         try
         {
+            var redirectUri = request.RedirectUri;
+            if (string.IsNullOrWhiteSpace(redirectUri))
+            {
+                var origin = Request.Headers.Origin.FirstOrDefault();
+                if (!string.IsNullOrWhiteSpace(origin))
+                {
+                    redirectUri = $"{origin.TrimEnd('/')}/login";
+                }
+            }
+
             var result = await _googleSsoHandler.HandleAsync(
-                new GoogleSsoCommand(request.Token, request.CodeVerifier, request.RedirectUri),
+                new GoogleSsoCommand(request.Token, request.CodeVerifier, redirectUri),
                 cancellationToken);
 
             // Returns a single unified response payload that satisfies both Redux (mobile) and local storage (web) hydrations

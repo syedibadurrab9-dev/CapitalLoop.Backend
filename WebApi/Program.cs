@@ -21,6 +21,7 @@ builder.Configuration.AddJsonFile("appsettings.local.json", optional: true, relo
 #region CONTROLLERS + SIGNALR
 builder.Services.AddControllers();
 builder.Services.AddSignalR();
+builder.Services.AddSingleton<WebApi.Hubs.ISupportSessionManager, WebApi.Hubs.SupportSessionManager>();
 #endregion
 
 #region OPENAPI

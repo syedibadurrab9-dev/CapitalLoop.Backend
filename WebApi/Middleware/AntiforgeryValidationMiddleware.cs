@@ -44,7 +44,12 @@ public class AntiforgeryValidationMiddleware
             {
                 var isAllowed = AllowedOrigins.Contains(origin) ||
                     (Uri.TryCreate(origin, UriKind.Absolute, out var uri) && 
-                     (uri.Host == "localhost" || uri.Host == "127.0.0.1" || uri.Host.StartsWith("192.168.") || uri.Host.StartsWith("10.")));
+                     (uri.Host == "localhost" || 
+                      uri.Host == "127.0.0.1" || 
+                      uri.Host.StartsWith("192.168.") || 
+                      uri.Host.StartsWith("10.") ||
+                      uri.Host.EndsWith("trycloudflare.com", StringComparison.OrdinalIgnoreCase) ||
+                      uri.Host.EndsWith("vercel.app", StringComparison.OrdinalIgnoreCase)));
 
                 if (!isAllowed)
                 {
