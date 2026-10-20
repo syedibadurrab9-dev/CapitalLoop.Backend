@@ -86,59 +86,67 @@ public class SupportHub : Hub
     }
 
     /// <summary>
-    /// Invoked by an advisor from the Angular portal to send an official response to an investor
+    /// Invoked by an advisor from the Angular portal (Exactly 2 arguments)
     /// </summary>
-    public async Task SendAgentReplyToClient(string targetClientEmail, string messagePayload, string? consultantLicense = null)
+    public async Task SendAgentReplyToClient(string targetClientEmail, string messagePayload)
     {
-        var normalizedClient = targetClientEmail.Trim().ToLowerInvariant();
-        var agentEmail = Context.User?.FindFirst(ClaimTypes.Email)?.Value?.Trim().ToLowerInvariant() ?? "system_agent";
-        var agentName = Context.User?.FindFirst(ClaimTypes.Name)?.Value ?? "SECP Advisory Consultant";
-
-        var session = _sessionManager.GetSession(normalizedClient);
-
-        // Check single-advisor engagement locking:
-        // If session is already engaged by another advisor, prevent cross-advisor collision!
-        if (session != null && session.Status == "ENGAGED" &&
-            !string.IsNullOrEmpty(session.AssignedAdvisorEmail) &&
-            !string.Equals(session.AssignedAdvisorEmail, agentEmail, StringComparison.OrdinalIgnoreCase))
+        try
         {
-            _logger.LogWarning("⚠️ Collision avoided: Advisor {Agent} attempted to message client {Client} already locked to {Assigned}",
-                agentEmail, normalizedClient, session.AssignedAdvisorEmail);
+            var normalizedClient = targetClientEmail.Trim().ToLowerInvariant();
+            var agentEmail = Context.User?.FindFirst(ClaimTypes.Email)?.Value?.Trim().ToLowerInvariant() ?? "system_agent";
+            var agentName = Context.User?.FindFirst(ClaimTypes.Name)?.Value ?? "SECP Advisory Consultant";
 
-            await Clients.Caller.SendAsync("EngagementWarning", 
-                $"Investor is currently engaged with {session.AssignedAdvisorName} ({session.AssignedAdvisorEmail}). Take over the session to reply.");
-            return;
-        }
+            var session = _sessionManager.GetSession(normalizedClient);
 
-        // If session is unassigned, automatically claim it for this responding advisor
-        if (session == null || session.Status != "ENGAGED")
-        {
-            var claimResult = _sessionManager.TryClaimSession(normalizedClient, agentEmail, agentName, consultantLicense);
-            if (claimResult.Success)
+            // Check single-advisor engagement locking:
+            // If session is already engaged by another advisor, prevent cross-advisor collision!
+            if (session != null && session.Status == "ENGAGED" &&
+                !string.IsNullOrEmpty(session.AssignedAdvisorEmail) &&
+                !string.Equals(session.AssignedAdvisorEmail, agentEmail, StringComparison.OrdinalIgnoreCase))
             {
-                await Clients.Group("AgentsGroup").SendAsync("InvestorEngagementChanged", claimResult.Session);
-                await Clients.Group($"ClientGroup_{normalizedClient}").SendAsync(
-                    "AdvisorAssigned", agentEmail, agentName, claimResult.Session.AssignedAdvisorLicense);
+                _logger.LogWarning("⚠️ Collision avoided: Advisor {Agent} attempted to message client {Client} already locked to {Assigned}",
+                    agentEmail, normalizedClient, session.AssignedAdvisorEmail);
+
+                await Clients.Caller.SendAsync("EngagementWarning", 
+                    $"Investor is currently engaged with {session.AssignedAdvisorName} ({session.AssignedAdvisorEmail}). Take over the session to reply.");
+                return;
             }
+
+            // If session is unassigned, automatically claim it for this responding advisor
+            if (session == null || session.Status != "ENGAGED")
+            {
+                var claimResult = _sessionManager.TryClaimSession(normalizedClient, agentEmail, agentName, null);
+                if (claimResult.Success)
+                {
+                    await Clients.Group("AgentsGroup").SendAsync("InvestorEngagementChanged", claimResult.Session);
+                    await Clients.Group($"ClientGroup_{normalizedClient}").SendAsync(
+                        "AdvisorAssigned", agentEmail, agentName, claimResult.Session.AssignedAdvisorLicense);
+                }
+            }
+
+            _logger.LogInformation("✉️ Agent {Agent} ({Name}) replying to client {Client}: {Payload}", agentEmail, agentName, normalizedClient, messagePayload);
+
+            // Store message in persistent session history
+            var msg = _sessionManager.AddMessage(normalizedClient, agentEmail, agentName, messagePayload, isAgentSender: true);
+
+            // Send directly to the investor's connection group
+            await Clients.Group($"ClientGroup_{normalizedClient}").SendAsync("ReceiveAgentMessage", agentEmail, messagePayload);
+
+            // Echo to all advisors so portal conversation views remain synchronized
+            await Clients.Group("AgentsGroup").SendAsync("ReceiveAgentMessage", agentEmail, messagePayload);
+            await Clients.Group("AgentsGroup").SendAsync("ChatUpdated", normalizedClient);
         }
-
-        _logger.LogInformation("✉️ Agent {Agent} ({Name}) replying to client {Client}", agentEmail, agentName, normalizedClient);
-
-        // Store message in persistent session history
-        var msg = _sessionManager.AddMessage(normalizedClient, agentEmail, agentName, messagePayload, isAgentSender: true);
-
-        // Send directly to the investor's connection group
-        await Clients.Group($"ClientGroup_{normalizedClient}").SendAsync("ReceiveAgentMessage", agentEmail, messagePayload);
-
-        // Echo to all advisors so portal conversation views remain synchronized
-        await Clients.Group("AgentsGroup").SendAsync("ReceiveAgentMessage", agentEmail, messagePayload);
-        await Clients.Group("AgentsGroup").SendAsync("ChatUpdated", normalizedClient);
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "❌ Fault in SendAgentReplyToClient for target client {Client}", targetClientEmail);
+            throw;
+        }
     }
 
     /// <summary>
-    /// Explicitly locks/claims an investor session to the calling advisor
+    /// Explicitly locks/claims an investor session to the calling advisor (Exactly 3 arguments)
     /// </summary>
-    public async Task<object> ClaimInvestorSession(string targetClientEmail, string? consultantLicense = null, bool forceTakeover = false)
+    public async Task<object> ClaimInvestorSession(string targetClientEmail, string? consultantLicense, bool forceTakeover)
     {
         var normalizedClient = targetClientEmail.Trim().ToLowerInvariant();
         var agentEmail = Context.User?.FindFirst(ClaimTypes.Email)?.Value?.Trim().ToLowerInvariant() ?? "system_agent";
@@ -167,7 +175,7 @@ public class SupportHub : Hub
     }
 
     /// <summary>
-    /// Releases an investor session back to the unassigned common pool
+    /// Releases an investor session back to the unassigned common pool (Exactly 1 argument)
     /// </summary>
     public async Task<object> ReleaseInvestorSession(string targetClientEmail)
     {
@@ -193,7 +201,7 @@ public class SupportHub : Hub
     }
 
     /// <summary>
-    /// Fetches all active sessions with engagement states for the calling advisor
+    /// Fetches all active sessions with engagement states for the calling advisor (0 arguments)
     /// </summary>
     public Task<IReadOnlyCollection<InvestorChatSession>> GetActiveSessions()
     {
@@ -201,7 +209,7 @@ public class SupportHub : Hub
     }
 
     /// <summary>
-    /// Sends real-time typing indicators between counterparts
+    /// Sends real-time typing indicators between counterparts (Exactly 2 arguments)
     /// </summary>
     public async Task SendTypingNotification(string targetEmail, bool isTyping)
     {
